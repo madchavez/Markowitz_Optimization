@@ -1,5 +1,12 @@
 # Title: Enhanced Markowitz Stock Portfolio Optimization Using PCA and Random Matrix Theory
 
+## Contributors:
+
+Isabel Beatrice Bucayan
+Miguel Antonio Chavez
+Fran Christ Magat
+Kendrick Francis T. Torres
+
 ## Abstract:
 
 This study enhances the classical Markowitz portfolio optimization framework by addressing one of its core weaknesses: the instability of covariance estimation in high-dimensional financial data. Using daily returns from the full S&P 500 universe, we construct and compare three portfolio pipelines—Raw Covariance, PCA-Processed Covariance, and Random Matrix Theory (RMT)–Cleaned Covariance. PCA is used to extract dominant market factors and reduce dimensionality, while RMT filters out noise by isolating statistically significant eigenvalues from the bulk spectrum. Each covariance model is then applied to generate minimum-variance and maximum-Sharpe portfolios. This enables us to focus on understanding the structural differences between the three methods and illustrates how PCA and RMT alter the underlying risk representation within the Markowitz optimization pipeline.
