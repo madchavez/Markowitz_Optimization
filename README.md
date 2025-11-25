@@ -2,10 +2,10 @@
 
 ## Contributors:
 
-Isabel Beatrice Bucayan
-Miguel Antonio Chavez
-Fran Christ Magat
-Kendrick Francis T. Torres
+Isabel Beatrice Bucayan   
+Miguel Antonio Chavez   
+Fran Christ Magat   
+Kendrick Francis T. Torres   
 
 ## Abstract:
 
