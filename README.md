@@ -151,15 +151,13 @@ The **Efficient Frontier Portfolio** is the set of all portfolios that give the 
 $$ \mu_{\text{target}} \in \{\mu_{\min}, \ldots, \mu_{\max}\}.$$
 
 For each target return, the optimizer solves
-\[
-\begin{aligned}
-\min_{w} \quad & w^\top C\, w \\
-\text{s.t.} \quad 
-& \mu^\top w = \mu_{\text{target}}, \\
-& \sum_i w_i = 1, \\
-& 0 \le w_i \le 1 \quad \forall i.
-\end{aligned}
-\]
+$$
+\min_w\; w^\top C w \\
+\text{s.t. } \mu^\top w = \mu_{\text{target}} \\
+\sum_i w_i = 1 \\
+0 \le w_i \le 1 \;\forall i
+$$
+
 
 The resulting list of volatilities and weight vectors forms a discrete approximation of the efficient frontier. In implementation, `scipy.optimize.minimize` is used to solve each optimization problem under long-only and full-investment constraints. The output includes:
 - portfolio volatilities along the frontier,
