@@ -656,6 +656,17 @@ def recall_at_k(relevances, k):
     hits_at_k = np.sum(rel[:k] > 0)
     return float(hits_at_k / total_relevant)
 
+def coverage_at_k(ranked_items, n_items, k=10):
+    """
+    User-level coverage@k as fraction of total catalog appearing in top-k.
+    """
+    if n_items <= 0:
+        return np.nan
+    top_items = list(ranked_items[:k])
+    if len(top_items) == 0:
+        return 0.0
+    return float(len(set(top_items)) / n_items)
+
 def ndcg_from_als(M_train, M_test, U, V, user_idx, k=10):
     """
     NDCG@k for one user.
@@ -725,6 +736,27 @@ def mean_recall_from_als(M_train, M_test, U, V, k=10):
         if not np.isnan(val):
             vals.append(val)
 
+    return float(np.mean(vals)) if vals else np.nan
+
+def coverage_from_als(M_train, U, V, user_idx, k=10):
+    M_arr = np.asarray(M_train, dtype=float)
+    n_items = M_arr.shape[1]
+    ranked_idx, _ = recommend_from_als(
+        M=M_arr,
+        U=U,
+        V=V,
+        user_idx=user_idx,
+        top_n=k,
+    )
+    return coverage_at_k(ranked_idx.tolist(), n_items=n_items, k=k)
+
+def mean_coverage_from_als(M_train, U, V, k=10):
+    vals = []
+    n_users = np.asarray(M_train).shape[0]
+    for user_idx in range(n_users):
+        v = coverage_from_als(M_train=M_train, U=U, V=V, user_idx=user_idx, k=k)
+        if not np.isnan(v):
+            vals.append(v)
     return float(np.mean(vals)) if vals else np.nan
 
 def make_holdout(util, test_frac=0.2, min_pos=2, seed=42):
@@ -832,6 +864,31 @@ def mean_recall_from_scores(M_train, M_test, U, V, k=10):
             vals.append(v)
     return float(np.mean(vals)) if vals else np.nan
 
+def coverage_from_scores(M_train, U, V, investor_id, k=10):
+    ranked_scores = investor_recommender_scores_als(
+        M=M_train,
+        U=U,
+        V=V,
+        investor_id=investor_id,
+        exclude_observed=True,
+    )
+    ranked_items = ranked_scores.dropna().index.tolist()
+    return coverage_at_k(ranked_items, n_items=len(M_train.columns), k=k)
+
+def mean_coverage_from_scores(M_train, U, V, k=10):
+    vals = []
+    for investor_id in M_train.index:
+        v = coverage_from_scores(
+            M_train=M_train,
+            U=U,
+            V=V,
+            investor_id=investor_id,
+            k=k,
+        )
+        if not np.isnan(v):
+            vals.append(v)
+    return float(np.mean(vals)) if vals else np.nan
+
 
 def popularity_scores(M_train):
     """
@@ -921,6 +978,30 @@ def mean_recall_from_popularity(M_train, M_test, k=10):
         if not np.isnan(v):
             vals.append(v)
 
+    return float(np.mean(vals)) if vals else np.nan
+
+def coverage_from_popularity(M_train, investor_id, pop_scores, k=10):
+    ranked_scores = recommend_from_popularity(
+        M_train=M_train,
+        investor_id=investor_id,
+        pop_scores=pop_scores,
+        top_n=len(M_train.columns),
+    )
+    ranked_items = ranked_scores.dropna().index.tolist()
+    return coverage_at_k(ranked_items, n_items=len(M_train.columns), k=k)
+
+def mean_coverage_from_popularity(M_train, k=10):
+    pop_scores = popularity_scores(M_train)
+    vals = []
+    for investor_id in M_train.index:
+        v = coverage_from_popularity(
+            M_train=M_train,
+            investor_id=investor_id,
+            pop_scores=pop_scores,
+            k=k,
+        )
+        if not np.isnan(v):
+            vals.append(v)
     return float(np.mean(vals)) if vals else np.nan
 
 
@@ -1213,6 +1294,17 @@ def recall_from_user_user(M_train, M_test, investor_id, user_sim, k=10, top_k_ne
     rel = np.nan_to_num(M_test.loc[investor_id, ranked_items].values, nan=0.0)
     return recall_at_k(rel, k)
 
+def coverage_from_user_user(M_train, investor_id, user_sim, k=10, top_k_neighbors=25):
+    ranked_scores = recommend_from_user_user(
+        M_train=M_train,
+        investor_id=investor_id,
+        user_sim=user_sim,
+        top_n=len(M_train.columns),
+        top_k_neighbors=top_k_neighbors,
+    )
+    ranked_items = ranked_scores.dropna().index.tolist()
+    return coverage_at_k(ranked_items, n_items=len(M_train.columns), k=k)
+
 
 def ndcg_from_item_item(M_train, M_test, investor_id, item_sim, k=10, top_k_neighbors=25):
     ranked_scores = recommend_from_item_item(
@@ -1248,6 +1340,17 @@ def recall_from_item_item(M_train, M_test, investor_id, item_sim, k=10, top_k_ne
     ranked_items = ranked_scores.dropna().index.tolist()
     rel = np.nan_to_num(M_test.loc[investor_id, ranked_items].values, nan=0.0)
     return recall_at_k(rel, k)
+
+def coverage_from_item_item(M_train, investor_id, item_sim, k=10, top_k_neighbors=25):
+    ranked_scores = recommend_from_item_item(
+        M_train=M_train,
+        investor_id=investor_id,
+        item_sim=item_sim,
+        top_n=len(M_train.columns),
+        top_k_neighbors=top_k_neighbors,
+    )
+    ranked_items = ranked_scores.dropna().index.tolist()
+    return coverage_at_k(ranked_items, n_items=len(M_train.columns), k=k)
 
 
 def mean_ndcg_from_user_user(M_train, M_test, k=10, top_k_neighbors=25):
@@ -1359,6 +1462,53 @@ def mean_recall_from_user_user(M_train, M_test, k=10, top_k_neighbors=25):
 
     return float(np.mean(vals)) if vals else np.nan
 
+def mean_coverage_from_user_user(M_train, k=10, top_k_neighbors=25):
+    neighbor_idx, neighbor_sim = user_user_topk_neighbors(
+        M_train,
+        top_k_neighbors=top_k_neighbors,
+    )
+    X = M_train.astype(float).to_numpy()
+    X_filled = np.nan_to_num(X, nan=0.0)
+    observed_bool = np.isfinite(X)
+    observed_float = observed_bool.astype(float)
+    n_items = X.shape[1]
+
+    vals = []
+
+    for user_idx in range(X.shape[0]):
+        row_idx = neighbor_idx[user_idx]
+        row_sim = neighbor_sim[user_idx]
+        keep = row_idx >= 0
+
+        row_idx = row_idx[keep].astype(int, copy=False)
+        row_sim = row_sim[keep].astype(float, copy=False)
+
+        if row_idx.size:
+            weighted_sum = row_sim @ X_filled[row_idx]
+            normalizer = row_sim @ observed_float[row_idx]
+        else:
+            weighted_sum = np.zeros(n_items, dtype=float)
+            normalizer = np.zeros(n_items, dtype=float)
+
+        scores = np.divide(
+            weighted_sum,
+            normalizer,
+            out=np.zeros(n_items, dtype=float),
+            where=normalizer > 0,
+        )
+
+        observed_user = observed_bool[user_idx]
+        scores[observed_user] = -np.inf
+
+        ranked_idx = np.argsort(scores)[::-1]
+        ranked_idx = ranked_idx[np.isfinite(scores[ranked_idx])]
+
+        v = coverage_at_k(ranked_idx.tolist(), n_items=n_items, k=k)
+        if not np.isnan(v):
+            vals.append(v)
+
+    return float(np.mean(vals)) if vals else np.nan
+
 
 def mean_ndcg_from_item_item(M_train, M_test, k=10, top_k_neighbors=25):
     sim = item_item_similarity(M_train)
@@ -1405,6 +1555,42 @@ def mean_recall_from_item_item(M_train, M_test, k=10, top_k_neighbors=25):
             k=k,
             top_k_neighbors=top_k_neighbors,
         )
+        if not np.isnan(v):
+            vals.append(v)
+
+    return float(np.mean(vals)) if vals else np.nan
+
+def mean_coverage_from_item_item(M_train, k=10, top_k_neighbors=25):
+    sim = item_item_similarity(M_train).to_numpy(copy=True)
+    np.fill_diagonal(sim, 0.0)
+    sim = np.clip(sim, 0.0, None)
+    if top_k_neighbors is not None and top_k_neighbors > 0 and top_k_neighbors < sim.shape[0]:
+        sim = _prune_similarity_topk(sim, top_k_neighbors=top_k_neighbors, axis=0)
+
+    X = M_train.astype(float).to_numpy()
+    user_values = np.nan_to_num(X, nan=0.0)
+    observed_bool = np.isfinite(X)
+    observed_float = observed_bool.astype(float)
+    n_items = X.shape[1]
+
+    vals = []
+    for user_idx in range(X.shape[0]):
+        weighted_sum = user_values[user_idx] @ sim
+        normalizer = observed_float[user_idx] @ sim
+        scores = np.divide(
+            weighted_sum,
+            normalizer,
+            out=np.zeros(n_items, dtype=float),
+            where=normalizer > 0,
+        )
+
+        observed_user = observed_bool[user_idx]
+        scores[observed_user] = -np.inf
+
+        ranked_idx = np.argsort(scores)[::-1]
+        ranked_idx = ranked_idx[np.isfinite(scores[ranked_idx])]
+
+        v = coverage_at_k(ranked_idx.tolist(), n_items=n_items, k=k)
         if not np.isnan(v):
             vals.append(v)
 
