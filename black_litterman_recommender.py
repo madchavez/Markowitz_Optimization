@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.neighbors import NearestNeighbors
 
 import utils as ut
 from markowitz_analysis import PCAResults, RMTResults, RawResults
@@ -647,6 +648,14 @@ def dcg_at_k(relevances, k):
     discounts = 1.0 / np.log2(np.arange(2, rel.size + 2))
     return np.sum(rel * discounts)
 
+def recall_at_k(relevances, k):
+    rel = np.asarray(relevances, dtype=float)
+    total_relevant = np.sum(rel > 0)
+    if total_relevant == 0:
+        return np.nan
+    hits_at_k = np.sum(rel[:k] > 0)
+    return float(hits_at_k / total_relevant)
+
 def ndcg_from_als(M_train, M_test, U, V, user_idx, k=10):
     """
     NDCG@k for one user.
@@ -687,6 +696,32 @@ def mean_ndcg_from_als(M_train, M_test, U, V, k=10):
 
     for user_idx in range(n_users):
         val = ndcg_from_als(M_train, M_test, U, V, user_idx, k=k)
+        if not np.isnan(val):
+            vals.append(val)
+
+    return float(np.mean(vals)) if vals else np.nan
+
+def recall_from_als(M_train, M_test, U, V, user_idx, k=10):
+    """
+    Recall@k for one user using ALS latent factors.
+    """
+    M_train = np.asarray(M_train, dtype=float)
+    M_test = np.asarray(M_test, dtype=float)
+
+    scores = U[user_idx] @ V.T
+    candidate_mask = ~np.isfinite(M_train[user_idx])
+    candidates = np.where(candidate_mask)[0]
+    ranked = candidates[np.argsort(scores[candidates])[::-1]]
+
+    rel = np.nan_to_num(M_test[user_idx, ranked], nan=0.0)
+    return recall_at_k(rel, k)
+
+def mean_recall_from_als(M_train, M_test, U, V, k=10):
+    vals = []
+    n_users = np.asarray(M_train).shape[0]
+
+    for user_idx in range(n_users):
+        val = recall_from_als(M_train, M_test, U, V, user_idx, k=k)
         if not np.isnan(val):
             vals.append(val)
 
@@ -776,6 +811,27 @@ def mean_ndcg_from_scores(M_train, M_test, U, V, k=10):
             vals.append(v)
     return float(np.mean(vals)) if vals else np.nan
 
+def recall_from_scores(M_train, M_test, U, V, investor_id, k=10):
+    ranked_scores = investor_recommender_scores_als(
+        M=M_train,
+        U=U,
+        V=V,
+        investor_id=investor_id,
+        exclude_observed=True,
+    )
+
+    ranked_items = ranked_scores.dropna().index.tolist()
+    rel = np.nan_to_num(M_test.loc[investor_id, ranked_items].values, nan=0.0)
+    return recall_at_k(rel, k)
+
+def mean_recall_from_scores(M_train, M_test, U, V, k=10):
+    vals = []
+    for investor_id in M_train.index:
+        v = recall_from_scores(M_train, M_test, U, V, investor_id=investor_id, k=k)
+        if not np.isnan(v):
+            vals.append(v)
+    return float(np.mean(vals)) if vals else np.nan
+
 
 def popularity_scores(M_train):
     """
@@ -838,6 +894,35 @@ def mean_ndcg_from_popularity(M_train, M_test, k=10):
 
     return float(np.mean(vals)) if vals else np.nan
 
+def recall_from_popularity(M_train, M_test, investor_id, pop_scores, k=10):
+    ranked_scores = recommend_from_popularity(
+        M_train=M_train,
+        investor_id=investor_id,
+        pop_scores=pop_scores,
+        top_n=len(M_train.columns),
+    )
+
+    ranked_items = ranked_scores.dropna().index.tolist()
+    rel = np.nan_to_num(M_test.loc[investor_id, ranked_items].values, nan=0.0)
+    return recall_at_k(rel, k)
+
+def mean_recall_from_popularity(M_train, M_test, k=10):
+    pop_scores = popularity_scores(M_train)
+    vals = []
+
+    for investor_id in M_train.index:
+        v = recall_from_popularity(
+            M_train=M_train,
+            M_test=M_test,
+            investor_id=investor_id,
+            pop_scores=pop_scores,
+            k=k,
+        )
+        if not np.isnan(v):
+            vals.append(v)
+
+    return float(np.mean(vals)) if vals else np.nan
+
 
 def _cosine_similarity_matrix(X):
     X = np.asarray(X, dtype=float)
@@ -884,9 +969,67 @@ def user_user_similarity(M_train):
     """
     User-user cosine similarity from train matrix (NaN treated as missing).
     """
+    n_users = M_train.shape[0]
+    if n_users > 5000:
+        raise MemoryError(
+            "Dense user-user similarity is too large for this dataset. "
+            "Use user_user_topk_neighbors(...) or mean_ndcg_from_user_user(...)."
+        )
+
     X = M_train.fillna(0.0).astype(float).values
     sim = _cosine_similarity_matrix(X)
     return pd.DataFrame(sim, index=M_train.index, columns=M_train.index)
+
+
+def user_user_topk_neighbors(M_train, top_k_neighbors=25):
+    """
+    Build memory-safe top-k user neighborhoods using cosine KNN.
+
+    Returns
+    -------
+    neighbor_idx : np.ndarray, shape (n_users, k)
+        Neighbor user-row indices for each user. Missing slots are -1.
+    neighbor_sim : np.ndarray, shape (n_users, k)
+        Corresponding non-negative cosine similarities.
+    """
+    if top_k_neighbors is None or top_k_neighbors <= 0:
+        raise ValueError("top_k_neighbors must be a positive integer.")
+
+    X = M_train.fillna(0.0).astype(np.float32).to_numpy(copy=True)
+    n_users = X.shape[0]
+    if n_users == 0:
+        return np.empty((0, 0), dtype=np.int32), np.empty((0, 0), dtype=np.float32)
+
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    X /= norms
+
+    k = min(int(top_k_neighbors), max(0, n_users - 1))
+    if k == 0:
+        return np.empty((n_users, 0), dtype=np.int32), np.empty((n_users, 0), dtype=np.float32)
+
+    knn = NearestNeighbors(n_neighbors=k + 1, metric="cosine", algorithm="brute")
+    knn.fit(X)
+    distances, indices = knn.kneighbors(X, return_distance=True)
+    similarities = np.clip(1.0 - distances, 0.0, None).astype(np.float32, copy=False)
+
+    neighbor_idx = np.full((n_users, k), -1, dtype=np.int32)
+    neighbor_sim = np.zeros((n_users, k), dtype=np.float32)
+
+    for user_idx in range(n_users):
+        row_idx = indices[user_idx]
+        row_sim = similarities[user_idx]
+        keep = row_idx != user_idx
+
+        row_idx = row_idx[keep]
+        row_sim = row_sim[keep]
+
+        take = min(k, row_idx.size)
+        if take > 0:
+            neighbor_idx[user_idx, :take] = row_idx[:take]
+            neighbor_sim[user_idx, :take] = row_sim[:take]
+
+    return neighbor_idx, neighbor_sim
 
 
 def item_item_similarity(M_train):
@@ -912,36 +1055,66 @@ def recommend_from_user_user(
         raise KeyError(f"Investor '{investor_id}' not found.")
 
     user_idx = M_train.index.get_loc(investor_id)
-    X = M_train.astype(float).values
+    X = M_train.astype(float).to_numpy()
     X_filled = np.nan_to_num(X, nan=0.0)
     observed_mask = np.isfinite(X).astype(float)
 
-    if isinstance(user_sim, pd.DataFrame):
-        sim_row = (
-            user_sim.loc[investor_id]
-            .reindex(M_train.index)
-            .fillna(0.0)
-            .astype(float)
-            .values
-        )
+    if isinstance(user_sim, tuple) and len(user_sim) == 2:
+        neighbor_idx, neighbor_sim = user_sim
+        neighbor_idx = np.asarray(neighbor_idx)
+        neighbor_sim = np.asarray(neighbor_sim, dtype=float)
+
+        if user_idx >= neighbor_idx.shape[0] or user_idx >= neighbor_sim.shape[0]:
+            raise ValueError("Neighbor arrays do not align with M_train users.")
+
+        row_idx = neighbor_idx[user_idx]
+        row_sim = np.clip(neighbor_sim[user_idx], 0.0, None)
+        keep = row_idx >= 0
+
+        row_idx = row_idx[keep].astype(int, copy=False)
+        row_sim = row_sim[keep]
+
+        if (
+            top_k_neighbors is not None
+            and top_k_neighbors > 0
+            and top_k_neighbors < row_idx.size
+        ):
+            row_idx = row_idx[:top_k_neighbors]
+            row_sim = row_sim[:top_k_neighbors]
+
+        if row_idx.size:
+            weighted_sum = row_sim @ X_filled[row_idx]
+            normalizer = row_sim @ observed_mask[row_idx]
+        else:
+            weighted_sum = np.zeros(X.shape[1], dtype=float)
+            normalizer = np.zeros(X.shape[1], dtype=float)
     else:
-        sim_row = np.asarray(user_sim, dtype=float)[user_idx].copy()
+        if isinstance(user_sim, pd.DataFrame):
+            sim_row = (
+                user_sim.loc[investor_id]
+                .reindex(M_train.index)
+                .fillna(0.0)
+                .astype(float)
+                .values
+            )
+        else:
+            sim_row = np.asarray(user_sim, dtype=float)[user_idx].copy()
 
-    sim_row[user_idx] = 0.0
-    sim_row = np.clip(sim_row, 0.0, None)
+        sim_row[user_idx] = 0.0
+        sim_row = np.clip(sim_row, 0.0, None)
 
-    if (
-        top_k_neighbors is not None
-        and top_k_neighbors > 0
-        and top_k_neighbors < len(sim_row)
-    ):
-        keep = np.argpartition(sim_row, -top_k_neighbors)[-top_k_neighbors:]
-        mask = np.zeros_like(sim_row, dtype=bool)
-        mask[keep] = True
-        sim_row = np.where(mask, sim_row, 0.0)
+        if (
+            top_k_neighbors is not None
+            and top_k_neighbors > 0
+            and top_k_neighbors < len(sim_row)
+        ):
+            keep = np.argpartition(sim_row, -top_k_neighbors)[-top_k_neighbors:]
+            mask = np.zeros_like(sim_row, dtype=bool)
+            mask[keep] = True
+            sim_row = np.where(mask, sim_row, 0.0)
 
-    weighted_sum = sim_row @ X_filled
-    normalizer = sim_row @ observed_mask
+        weighted_sum = sim_row @ X_filled
+        normalizer = sim_row @ observed_mask
 
     scores = np.divide(
         weighted_sum,
@@ -1027,6 +1200,19 @@ def ndcg_from_user_user(M_train, M_test, investor_id, user_sim, k=10, top_k_neig
 
     return np.nan if idcg == 0 else dcg / idcg
 
+def recall_from_user_user(M_train, M_test, investor_id, user_sim, k=10, top_k_neighbors=25):
+    ranked_scores = recommend_from_user_user(
+        M_train=M_train,
+        investor_id=investor_id,
+        user_sim=user_sim,
+        top_n=len(M_train.columns),
+        top_k_neighbors=top_k_neighbors,
+    )
+
+    ranked_items = ranked_scores.dropna().index.tolist()
+    rel = np.nan_to_num(M_test.loc[investor_id, ranked_items].values, nan=0.0)
+    return recall_at_k(rel, k)
+
 
 def ndcg_from_item_item(M_train, M_test, investor_id, item_sim, k=10, top_k_neighbors=25):
     ranked_scores = recommend_from_item_item(
@@ -1050,20 +1236,124 @@ def ndcg_from_item_item(M_train, M_test, investor_id, item_sim, k=10, top_k_neig
 
     return np.nan if idcg == 0 else dcg / idcg
 
+def recall_from_item_item(M_train, M_test, investor_id, item_sim, k=10, top_k_neighbors=25):
+    ranked_scores = recommend_from_item_item(
+        M_train=M_train,
+        investor_id=investor_id,
+        item_sim=item_sim,
+        top_n=len(M_train.columns),
+        top_k_neighbors=top_k_neighbors,
+    )
+
+    ranked_items = ranked_scores.dropna().index.tolist()
+    rel = np.nan_to_num(M_test.loc[investor_id, ranked_items].values, nan=0.0)
+    return recall_at_k(rel, k)
+
 
 def mean_ndcg_from_user_user(M_train, M_test, k=10, top_k_neighbors=25):
-    sim = user_user_similarity(M_train)
+    neighbor_idx, neighbor_sim = user_user_topk_neighbors(
+        M_train,
+        top_k_neighbors=top_k_neighbors,
+    )
+
+    X = M_train.astype(float).to_numpy()
+    X_filled = np.nan_to_num(X, nan=0.0)
+    observed_bool = np.isfinite(X)
+    observed_float = observed_bool.astype(float)
+    test_vals = (
+        M_test.reindex(index=M_train.index, columns=M_train.columns)
+        .astype(float)
+        .to_numpy()
+    )
+
+    vals = []
+    n_items = X.shape[1]
+
+    for user_idx in range(X.shape[0]):
+        row_idx = neighbor_idx[user_idx]
+        row_sim = neighbor_sim[user_idx]
+        keep = row_idx >= 0
+
+        row_idx = row_idx[keep].astype(int, copy=False)
+        row_sim = row_sim[keep].astype(float, copy=False)
+
+        if row_idx.size == 0:
+            continue
+
+        weighted_sum = row_sim @ X_filled[row_idx]
+        normalizer = row_sim @ observed_float[row_idx]
+        scores = np.divide(
+            weighted_sum,
+            normalizer,
+            out=np.zeros(n_items, dtype=float),
+            where=normalizer > 0,
+        )
+
+        observed_user = observed_bool[user_idx]
+        scores[observed_user] = -np.inf
+
+        ranked_idx = np.argsort(scores)[::-1]
+        ranked_idx = ranked_idx[np.isfinite(scores[ranked_idx])]
+
+        rel = np.nan_to_num(test_vals[user_idx, ranked_idx], nan=0.0)
+        dcg = dcg_at_k(rel, k)
+
+        ideal_rel = np.sort(
+            np.nan_to_num(test_vals[user_idx, ~observed_user], nan=0.0)
+        )[::-1]
+        idcg = dcg_at_k(ideal_rel, k)
+
+        if idcg > 0:
+            vals.append(dcg / idcg)
+
+    return float(np.mean(vals)) if vals else np.nan
+
+def mean_recall_from_user_user(M_train, M_test, k=10, top_k_neighbors=25):
+    neighbor_idx, neighbor_sim = user_user_topk_neighbors(
+        M_train,
+        top_k_neighbors=top_k_neighbors,
+    )
+
+    X = M_train.astype(float).to_numpy()
+    X_filled = np.nan_to_num(X, nan=0.0)
+    observed_bool = np.isfinite(X)
+    observed_float = observed_bool.astype(float)
+    test_vals = (
+        M_test.reindex(index=M_train.index, columns=M_train.columns)
+        .astype(float)
+        .to_numpy()
+    )
+
     vals = []
 
-    for investor_id in M_train.index:
-        v = ndcg_from_user_user(
-            M_train=M_train,
-            M_test=M_test,
-            investor_id=investor_id,
-            user_sim=sim,
-            k=k,
-            top_k_neighbors=top_k_neighbors,
+    for user_idx in range(X.shape[0]):
+        row_idx = neighbor_idx[user_idx]
+        row_sim = neighbor_sim[user_idx]
+        keep = row_idx >= 0
+
+        row_idx = row_idx[keep].astype(int, copy=False)
+        row_sim = row_sim[keep].astype(float, copy=False)
+
+        if row_idx.size == 0:
+            continue
+
+        weighted_sum = row_sim @ X_filled[row_idx]
+        normalizer = row_sim @ observed_float[row_idx]
+        scores = np.divide(
+            weighted_sum,
+            normalizer,
+            out=np.zeros(X.shape[1], dtype=float),
+            where=normalizer > 0,
         )
+
+        observed_user = observed_bool[user_idx]
+        scores[observed_user] = -np.inf
+
+        ranked_idx = np.argsort(scores)[::-1]
+        ranked_idx = ranked_idx[np.isfinite(scores[ranked_idx])]
+
+        rel = np.nan_to_num(test_vals[user_idx, ranked_idx], nan=0.0)
+        v = recall_at_k(rel, k)
         if not np.isnan(v):
             vals.append(v)
 
@@ -1083,6 +1373,31 @@ def mean_ndcg_from_item_item(M_train, M_test, k=10, top_k_neighbors=25):
     vals = []
     for investor_id in M_train.index:
         v = ndcg_from_item_item(
+            M_train=M_train,
+            M_test=M_test,
+            investor_id=investor_id,
+            item_sim=sim,
+            k=k,
+            top_k_neighbors=top_k_neighbors,
+        )
+        if not np.isnan(v):
+            vals.append(v)
+
+    return float(np.mean(vals)) if vals else np.nan
+
+def mean_recall_from_item_item(M_train, M_test, k=10, top_k_neighbors=25):
+    sim = item_item_similarity(M_train)
+    if top_k_neighbors is not None and top_k_neighbors > 0 and top_k_neighbors < sim.shape[0]:
+        sim = pd.DataFrame(
+            _prune_similarity_topk(sim.values, top_k_neighbors=top_k_neighbors, axis=0),
+            index=sim.index,
+            columns=sim.columns,
+        )
+        top_k_neighbors = None
+
+    vals = []
+    for investor_id in M_train.index:
+        v = recall_from_item_item(
             M_train=M_train,
             M_test=M_test,
             investor_id=investor_id,
