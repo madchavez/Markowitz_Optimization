@@ -837,3 +837,260 @@ def mean_ndcg_from_popularity(M_train, M_test, k=10):
             vals.append(v)
 
     return float(np.mean(vals)) if vals else np.nan
+
+
+def _cosine_similarity_matrix(X):
+    X = np.asarray(X, dtype=float)
+    gram = X @ X.T
+    norms = np.linalg.norm(X, axis=1)
+    denom = np.outer(norms, norms)
+    sim = np.divide(gram, denom, out=np.zeros_like(gram), where=denom > 0)
+    np.fill_diagonal(sim, 0.0)
+    return sim
+
+
+def _prune_similarity_topk(sim, top_k_neighbors, axis=1):
+    sim = np.asarray(sim, dtype=float)
+    if sim.ndim != 2 or sim.shape[0] != sim.shape[1]:
+        raise ValueError("sim must be a square 2D matrix.")
+    n = sim.shape[0]
+
+    pruned = sim.copy()
+    np.fill_diagonal(pruned, 0.0)
+    pruned[pruned < 0] = 0.0
+
+    if top_k_neighbors is None or top_k_neighbors <= 0 or top_k_neighbors >= n:
+        return pruned
+
+    keep = np.zeros_like(pruned, dtype=bool)
+
+    if axis == 1:
+        for i in range(n):
+            row = pruned[i]
+            idx = np.argpartition(row, -top_k_neighbors)[-top_k_neighbors:]
+            keep[i, idx] = True
+    elif axis == 0:
+        for j in range(n):
+            col = pruned[:, j]
+            idx = np.argpartition(col, -top_k_neighbors)[-top_k_neighbors:]
+            keep[idx, j] = True
+    else:
+        raise ValueError("axis must be 0 (column-wise) or 1 (row-wise).")
+
+    return np.where(keep, pruned, 0.0)
+
+
+def user_user_similarity(M_train):
+    """
+    User-user cosine similarity from train matrix (NaN treated as missing).
+    """
+    X = M_train.fillna(0.0).astype(float).values
+    sim = _cosine_similarity_matrix(X)
+    return pd.DataFrame(sim, index=M_train.index, columns=M_train.index)
+
+
+def item_item_similarity(M_train):
+    """
+    Item-item cosine similarity from train matrix (NaN treated as missing).
+    """
+    X = M_train.fillna(0.0).astype(float).values.T
+    sim = _cosine_similarity_matrix(X)
+    return pd.DataFrame(sim, index=M_train.columns, columns=M_train.columns)
+
+
+def recommend_from_user_user(
+    M_train,
+    investor_id,
+    user_sim,
+    top_n=10,
+    top_k_neighbors=25,
+):
+    """
+    Recommend assets for one investor using user-user neighborhood CF.
+    """
+    if investor_id not in M_train.index:
+        raise KeyError(f"Investor '{investor_id}' not found.")
+
+    user_idx = M_train.index.get_loc(investor_id)
+    X = M_train.astype(float).values
+    X_filled = np.nan_to_num(X, nan=0.0)
+    observed_mask = np.isfinite(X).astype(float)
+
+    if isinstance(user_sim, pd.DataFrame):
+        sim_row = (
+            user_sim.loc[investor_id]
+            .reindex(M_train.index)
+            .fillna(0.0)
+            .astype(float)
+            .values
+        )
+    else:
+        sim_row = np.asarray(user_sim, dtype=float)[user_idx].copy()
+
+    sim_row[user_idx] = 0.0
+    sim_row = np.clip(sim_row, 0.0, None)
+
+    if (
+        top_k_neighbors is not None
+        and top_k_neighbors > 0
+        and top_k_neighbors < len(sim_row)
+    ):
+        keep = np.argpartition(sim_row, -top_k_neighbors)[-top_k_neighbors:]
+        mask = np.zeros_like(sim_row, dtype=bool)
+        mask[keep] = True
+        sim_row = np.where(mask, sim_row, 0.0)
+
+    weighted_sum = sim_row @ X_filled
+    normalizer = sim_row @ observed_mask
+
+    scores = np.divide(
+        weighted_sum,
+        normalizer,
+        out=np.zeros_like(weighted_sum, dtype=float),
+        where=normalizer > 0,
+    )
+
+    scores = pd.Series(scores, index=M_train.columns, dtype=float)
+    observed_user = np.isfinite(M_train.loc[investor_id])
+    scores.loc[observed_user] = np.nan
+
+    return scores.sort_values(ascending=False).head(top_n)
+
+
+def recommend_from_item_item(
+    M_train,
+    investor_id,
+    item_sim,
+    top_n=10,
+    top_k_neighbors=25,
+):
+    """
+    Recommend assets for one investor using item-item neighborhood CF.
+    """
+    if investor_id not in M_train.index:
+        raise KeyError(f"Investor '{investor_id}' not found.")
+
+    if isinstance(item_sim, pd.DataFrame):
+        sim = (
+            item_sim.reindex(index=M_train.columns, columns=M_train.columns)
+            .fillna(0.0)
+            .astype(float)
+            .to_numpy(copy=True)
+        )
+    else:
+        sim = np.asarray(item_sim, dtype=float).copy()
+
+    np.fill_diagonal(sim, 0.0)
+    sim = np.clip(sim, 0.0, None)
+
+    if top_k_neighbors is not None and top_k_neighbors > 0 and top_k_neighbors < sim.shape[0]:
+        sim = _prune_similarity_topk(sim, top_k_neighbors=top_k_neighbors, axis=0)
+
+    user_ratings = M_train.loc[investor_id].astype(float).values
+    observed_user = np.isfinite(user_ratings)
+    user_values = np.nan_to_num(user_ratings, nan=0.0)
+
+    weighted_sum = user_values @ sim
+    normalizer = observed_user.astype(float) @ sim
+
+    scores = np.divide(
+        weighted_sum,
+        normalizer,
+        out=np.zeros_like(weighted_sum, dtype=float),
+        where=normalizer > 0,
+    )
+
+    scores = pd.Series(scores, index=M_train.columns, dtype=float)
+    scores.loc[observed_user] = np.nan
+    return scores.sort_values(ascending=False).head(top_n)
+
+
+def ndcg_from_user_user(M_train, M_test, investor_id, user_sim, k=10, top_k_neighbors=25):
+    ranked_scores = recommend_from_user_user(
+        M_train=M_train,
+        investor_id=investor_id,
+        user_sim=user_sim,
+        top_n=len(M_train.columns),
+        top_k_neighbors=top_k_neighbors,
+    )
+
+    ranked_items = ranked_scores.dropna().index.tolist()
+    rel = np.nan_to_num(M_test.loc[investor_id, ranked_items].values, nan=0.0)
+    dcg = dcg_at_k(rel, k)
+
+    observed_train = np.isfinite(M_train.loc[investor_id])
+    candidate_items = M_train.columns[~observed_train]
+    ideal_rel = np.sort(
+        np.nan_to_num(M_test.loc[investor_id, candidate_items].values, nan=0.0)
+    )[::-1]
+    idcg = dcg_at_k(ideal_rel, k)
+
+    return np.nan if idcg == 0 else dcg / idcg
+
+
+def ndcg_from_item_item(M_train, M_test, investor_id, item_sim, k=10, top_k_neighbors=25):
+    ranked_scores = recommend_from_item_item(
+        M_train=M_train,
+        investor_id=investor_id,
+        item_sim=item_sim,
+        top_n=len(M_train.columns),
+        top_k_neighbors=top_k_neighbors,
+    )
+
+    ranked_items = ranked_scores.dropna().index.tolist()
+    rel = np.nan_to_num(M_test.loc[investor_id, ranked_items].values, nan=0.0)
+    dcg = dcg_at_k(rel, k)
+
+    observed_train = np.isfinite(M_train.loc[investor_id])
+    candidate_items = M_train.columns[~observed_train]
+    ideal_rel = np.sort(
+        np.nan_to_num(M_test.loc[investor_id, candidate_items].values, nan=0.0)
+    )[::-1]
+    idcg = dcg_at_k(ideal_rel, k)
+
+    return np.nan if idcg == 0 else dcg / idcg
+
+
+def mean_ndcg_from_user_user(M_train, M_test, k=10, top_k_neighbors=25):
+    sim = user_user_similarity(M_train)
+    vals = []
+
+    for investor_id in M_train.index:
+        v = ndcg_from_user_user(
+            M_train=M_train,
+            M_test=M_test,
+            investor_id=investor_id,
+            user_sim=sim,
+            k=k,
+            top_k_neighbors=top_k_neighbors,
+        )
+        if not np.isnan(v):
+            vals.append(v)
+
+    return float(np.mean(vals)) if vals else np.nan
+
+
+def mean_ndcg_from_item_item(M_train, M_test, k=10, top_k_neighbors=25):
+    sim = item_item_similarity(M_train)
+    if top_k_neighbors is not None and top_k_neighbors > 0 and top_k_neighbors < sim.shape[0]:
+        sim = pd.DataFrame(
+            _prune_similarity_topk(sim.values, top_k_neighbors=top_k_neighbors, axis=0),
+            index=sim.index,
+            columns=sim.columns,
+        )
+        top_k_neighbors = None
+
+    vals = []
+    for investor_id in M_train.index:
+        v = ndcg_from_item_item(
+            M_train=M_train,
+            M_test=M_test,
+            investor_id=investor_id,
+            item_sim=sim,
+            k=k,
+            top_k_neighbors=top_k_neighbors,
+        )
+        if not np.isnan(v):
+            vals.append(v)
+
+    return float(np.mean(vals)) if vals else np.nan
