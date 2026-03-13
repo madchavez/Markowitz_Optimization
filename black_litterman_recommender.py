@@ -667,6 +667,34 @@ def coverage_at_k(ranked_items, n_items, k=10):
         return 0.0
     return float(len(set(top_items)) / n_items)
 
+def diversity_at_k(ranked_items, item_sim, k=10):
+    """
+    User-level intra-list diversity@k as 1 minus mean pairwise similarity.
+    """
+    top_items = list(ranked_items[:k])
+    if len(top_items) < 2:
+        return 0.0
+
+    if isinstance(item_sim, pd.DataFrame):
+        sim_block = (
+            item_sim.reindex(index=top_items, columns=top_items)
+            .fillna(0.0)
+            .astype(float)
+            .to_numpy(copy=True)
+        )
+    else:
+        sim_arr = np.asarray(item_sim, dtype=float)
+        if sim_arr.ndim != 2 or sim_arr.shape[0] != sim_arr.shape[1]:
+            raise ValueError("item_sim must be a square 2D matrix.")
+        idx = np.asarray(top_items, dtype=int)
+        sim_block = sim_arr[np.ix_(idx, idx)]
+
+    sim_block = np.clip(sim_block, 0.0, 1.0)
+    upper = sim_block[np.triu_indices(len(top_items), k=1)]
+    if upper.size == 0:
+        return 0.0
+    return float(1.0 - upper.mean())
+
 def ndcg_from_als(M_train, M_test, U, V, user_idx, k=10):
     """
     NDCG@k for one user.
@@ -755,6 +783,36 @@ def mean_coverage_from_als(M_train, U, V, k=10):
     n_users = np.asarray(M_train).shape[0]
     for user_idx in range(n_users):
         v = coverage_from_als(M_train=M_train, U=U, V=V, user_idx=user_idx, k=k)
+        if not np.isnan(v):
+            vals.append(v)
+    return float(np.mean(vals)) if vals else np.nan
+
+def diversity_from_als(M_train, U, V, user_idx, item_sim, k=10):
+    M_arr = np.asarray(M_train, dtype=float)
+    ranked_idx, _ = recommend_from_als(
+        M=M_arr,
+        U=U,
+        V=V,
+        user_idx=user_idx,
+        top_n=k,
+    )
+    return diversity_at_k(ranked_idx.tolist(), item_sim=item_sim, k=k)
+
+def mean_diversity_from_als(M_train, U, V, k=10):
+    M_arr = np.asarray(M_train, dtype=float)
+    item_sim = _cosine_similarity_matrix(np.nan_to_num(M_arr, nan=0.0).T)
+
+    vals = []
+    n_users = M_arr.shape[0]
+    for user_idx in range(n_users):
+        v = diversity_from_als(
+            M_train=M_arr,
+            U=U,
+            V=V,
+            user_idx=user_idx,
+            item_sim=item_sim,
+            k=k,
+        )
         if not np.isnan(v):
             vals.append(v)
     return float(np.mean(vals)) if vals else np.nan
@@ -889,6 +947,33 @@ def mean_coverage_from_scores(M_train, U, V, k=10):
             vals.append(v)
     return float(np.mean(vals)) if vals else np.nan
 
+def diversity_from_scores(M_train, U, V, investor_id, item_sim, k=10):
+    ranked_scores = investor_recommender_scores_als(
+        M=M_train,
+        U=U,
+        V=V,
+        investor_id=investor_id,
+        exclude_observed=True,
+    )
+    ranked_items = ranked_scores.dropna().index.tolist()
+    return diversity_at_k(ranked_items, item_sim=item_sim, k=k)
+
+def mean_diversity_from_scores(M_train, U, V, k=10):
+    item_sim = item_item_similarity(M_train)
+    vals = []
+    for investor_id in M_train.index:
+        v = diversity_from_scores(
+            M_train=M_train,
+            U=U,
+            V=V,
+            investor_id=investor_id,
+            item_sim=item_sim,
+            k=k,
+        )
+        if not np.isnan(v):
+            vals.append(v)
+    return float(np.mean(vals)) if vals else np.nan
+
 
 def popularity_scores(M_train):
     """
@@ -998,6 +1083,32 @@ def mean_coverage_from_popularity(M_train, k=10):
             M_train=M_train,
             investor_id=investor_id,
             pop_scores=pop_scores,
+            k=k,
+        )
+        if not np.isnan(v):
+            vals.append(v)
+    return float(np.mean(vals)) if vals else np.nan
+
+def diversity_from_popularity(M_train, investor_id, pop_scores, item_sim, k=10):
+    ranked_scores = recommend_from_popularity(
+        M_train=M_train,
+        investor_id=investor_id,
+        pop_scores=pop_scores,
+        top_n=len(M_train.columns),
+    )
+    ranked_items = ranked_scores.dropna().index.tolist()
+    return diversity_at_k(ranked_items, item_sim=item_sim, k=k)
+
+def mean_diversity_from_popularity(M_train, k=10):
+    pop_scores = popularity_scores(M_train)
+    item_sim = item_item_similarity(M_train)
+    vals = []
+    for investor_id in M_train.index:
+        v = diversity_from_popularity(
+            M_train=M_train,
+            investor_id=investor_id,
+            pop_scores=pop_scores,
+            item_sim=item_sim,
             k=k,
         )
         if not np.isnan(v):
@@ -1305,6 +1416,24 @@ def coverage_from_user_user(M_train, investor_id, user_sim, k=10, top_k_neighbor
     ranked_items = ranked_scores.dropna().index.tolist()
     return coverage_at_k(ranked_items, n_items=len(M_train.columns), k=k)
 
+def diversity_from_user_user(
+    M_train,
+    investor_id,
+    user_sim,
+    item_sim,
+    k=10,
+    top_k_neighbors=25,
+):
+    ranked_scores = recommend_from_user_user(
+        M_train=M_train,
+        investor_id=investor_id,
+        user_sim=user_sim,
+        top_n=len(M_train.columns),
+        top_k_neighbors=top_k_neighbors,
+    )
+    ranked_items = ranked_scores.dropna().index.tolist()
+    return diversity_at_k(ranked_items, item_sim=item_sim, k=k)
+
 
 def ndcg_from_item_item(M_train, M_test, investor_id, item_sim, k=10, top_k_neighbors=25):
     ranked_scores = recommend_from_item_item(
@@ -1351,6 +1480,23 @@ def coverage_from_item_item(M_train, investor_id, item_sim, k=10, top_k_neighbor
     )
     ranked_items = ranked_scores.dropna().index.tolist()
     return coverage_at_k(ranked_items, n_items=len(M_train.columns), k=k)
+
+def diversity_from_item_item(
+    M_train,
+    investor_id,
+    item_sim,
+    k=10,
+    top_k_neighbors=25,
+):
+    ranked_scores = recommend_from_item_item(
+        M_train=M_train,
+        investor_id=investor_id,
+        item_sim=item_sim,
+        top_n=len(M_train.columns),
+        top_k_neighbors=top_k_neighbors,
+    )
+    ranked_items = ranked_scores.dropna().index.tolist()
+    return diversity_at_k(ranked_items, item_sim=item_sim, k=k)
 
 
 def mean_ndcg_from_user_user(M_train, M_test, k=10, top_k_neighbors=25):
@@ -1509,6 +1655,54 @@ def mean_coverage_from_user_user(M_train, k=10, top_k_neighbors=25):
 
     return float(np.mean(vals)) if vals else np.nan
 
+def mean_diversity_from_user_user(M_train, k=10, top_k_neighbors=25):
+    neighbor_idx, neighbor_sim = user_user_topk_neighbors(
+        M_train,
+        top_k_neighbors=top_k_neighbors,
+    )
+    X = M_train.astype(float).to_numpy()
+    X_filled = np.nan_to_num(X, nan=0.0)
+    observed_bool = np.isfinite(X)
+    observed_float = observed_bool.astype(float)
+    item_sim = _cosine_similarity_matrix(X_filled.T)
+    n_items = X.shape[1]
+
+    vals = []
+
+    for user_idx in range(X.shape[0]):
+        row_idx = neighbor_idx[user_idx]
+        row_sim = neighbor_sim[user_idx]
+        keep = row_idx >= 0
+
+        row_idx = row_idx[keep].astype(int, copy=False)
+        row_sim = row_sim[keep].astype(float, copy=False)
+
+        if row_idx.size:
+            weighted_sum = row_sim @ X_filled[row_idx]
+            normalizer = row_sim @ observed_float[row_idx]
+        else:
+            weighted_sum = np.zeros(n_items, dtype=float)
+            normalizer = np.zeros(n_items, dtype=float)
+
+        scores = np.divide(
+            weighted_sum,
+            normalizer,
+            out=np.zeros(n_items, dtype=float),
+            where=normalizer > 0,
+        )
+
+        observed_user = observed_bool[user_idx]
+        scores[observed_user] = -np.inf
+
+        ranked_idx = np.argsort(scores)[::-1]
+        ranked_idx = ranked_idx[np.isfinite(scores[ranked_idx])]
+
+        v = diversity_at_k(ranked_idx.tolist(), item_sim=item_sim, k=k)
+        if not np.isnan(v):
+            vals.append(v)
+
+    return float(np.mean(vals)) if vals else np.nan
+
 
 def mean_ndcg_from_item_item(M_train, M_test, k=10, top_k_neighbors=25):
     sim = item_item_similarity(M_train)
@@ -1591,6 +1785,43 @@ def mean_coverage_from_item_item(M_train, k=10, top_k_neighbors=25):
         ranked_idx = ranked_idx[np.isfinite(scores[ranked_idx])]
 
         v = coverage_at_k(ranked_idx.tolist(), n_items=n_items, k=k)
+        if not np.isnan(v):
+            vals.append(v)
+
+    return float(np.mean(vals)) if vals else np.nan
+
+def mean_diversity_from_item_item(M_train, k=10, top_k_neighbors=25):
+    item_sim = item_item_similarity(M_train).to_numpy(copy=True)
+    sim = item_sim.copy()
+    np.fill_diagonal(sim, 0.0)
+    sim = np.clip(sim, 0.0, None)
+    if top_k_neighbors is not None and top_k_neighbors > 0 and top_k_neighbors < sim.shape[0]:
+        sim = _prune_similarity_topk(sim, top_k_neighbors=top_k_neighbors, axis=0)
+
+    X = M_train.astype(float).to_numpy()
+    user_values = np.nan_to_num(X, nan=0.0)
+    observed_bool = np.isfinite(X)
+    observed_float = observed_bool.astype(float)
+    n_items = X.shape[1]
+
+    vals = []
+    for user_idx in range(X.shape[0]):
+        weighted_sum = user_values[user_idx] @ sim
+        normalizer = observed_float[user_idx] @ sim
+        scores = np.divide(
+            weighted_sum,
+            normalizer,
+            out=np.zeros(n_items, dtype=float),
+            where=normalizer > 0,
+        )
+
+        observed_user = observed_bool[user_idx]
+        scores[observed_user] = -np.inf
+
+        ranked_idx = np.argsort(scores)[::-1]
+        ranked_idx = ranked_idx[np.isfinite(scores[ranked_idx])]
+
+        v = diversity_at_k(ranked_idx.tolist(), item_sim=item_sim, k=k)
         if not np.isnan(v):
             vals.append(v)
 
