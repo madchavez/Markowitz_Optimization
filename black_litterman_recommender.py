@@ -1826,3 +1826,405 @@ def mean_diversity_from_item_item(M_train, k=10, top_k_neighbors=25):
             vals.append(v)
 
     return float(np.mean(vals)) if vals else np.nan
+
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+
+def _rank_unseen(scores, observed_mask):
+    scores = np.asarray(scores, dtype=float).copy()
+    scores[observed_mask] = -np.inf
+    ranked_idx = np.argsort(scores)[::-1]
+    return ranked_idx[np.isfinite(scores[ranked_idx])]
+
+
+def _metrics_from_ranked_idx(ranked_idx, test_row, ideal_rel, item_sim, k=10):
+    ranked_idx = np.asarray(ranked_idx, dtype=int)
+
+    rel = (
+        np.nan_to_num(test_row[ranked_idx], nan=0.0)
+        if ranked_idx.size
+        else np.array([], dtype=float)
+    )
+    dcg = dcg_at_k(rel, k)
+    idcg = dcg_at_k(ideal_rel, k)
+    ndcg = np.nan if idcg == 0 else float(dcg / idcg)
+
+    recall = recall_at_k(rel, k)
+    diversity = diversity_at_k(ranked_idx.tolist(), item_sim=item_sim, k=k)
+
+    return {
+        "ndcg": ndcg,
+        "recall": recall,
+        "diversity": diversity,
+    }
+
+
+def _mean_or_nan(vals):
+    vals = [v for v in vals if not np.isnan(v)]
+    return float(np.mean(vals)) if vals else np.nan
+
+
+def compute_seed_metrics(
+    util,
+    U,
+    V,
+    seed,
+    k=10,
+    top_k_neighbors=25,
+    test_frac=0.2,
+    min_pos=2,
+):
+    """
+    Compute NDCG, Recall, and Diversity for one holdout seed in one pass.
+
+    Returns
+    -------
+    dict
+        {
+            "ndcg": {...},
+            "recall": {...},
+            "diversity": {...},
+        }
+    """
+    util_train, util_test = make_holdout(
+        util,
+        test_frac=test_frac,
+        min_pos=min_pos,
+        seed=seed,
+    )
+
+    X = util_train.astype(float).to_numpy(copy=True)
+    X_filled = np.nan_to_num(X, nan=0.0)
+    observed_bool = np.isfinite(X)
+    observed_float = observed_bool.astype(float)
+    user_values = X_filled
+    test_vals = (
+        util_test.reindex(index=util_train.index, columns=util_train.columns)
+        .astype(float)
+        .to_numpy(copy=True)
+    )
+
+    n_users, n_items = X.shape
+
+    U_arr = np.asarray(U, dtype=float)
+    V_arr = np.asarray(V, dtype=float)
+
+    if U_arr.shape[0] != n_users:
+        raise ValueError("U row count must match util row count.")
+    if V_arr.shape[0] != n_items:
+        raise ValueError("V row count must match util column count.")
+
+    # shared structures
+    als_scores_all = U_arr @ V_arr.T
+
+    pop_scores = (
+        util_train.mean(axis=0, skipna=True)
+        .reindex(util_train.columns)
+        .fillna(0.0)
+        .to_numpy(copy=True)
+    )
+
+    neighbor_idx, neighbor_sim = user_user_topk_neighbors(
+        util_train,
+        top_k_neighbors=top_k_neighbors,
+    )
+
+    item_sim_full = _cosine_similarity_matrix(X_filled.T)
+
+    sim_pruned = item_sim_full.copy()
+    np.fill_diagonal(sim_pruned, 0.0)
+    sim_pruned = np.clip(sim_pruned, 0.0, None)
+    if (
+        top_k_neighbors is not None
+        and top_k_neighbors > 0
+        and top_k_neighbors < sim_pruned.shape[0]
+    ):
+        sim_pruned = _prune_similarity_topk(
+            sim_pruned,
+            top_k_neighbors=top_k_neighbors,
+            axis=0,
+        )
+
+    ii_weighted_sum_all = user_values @ sim_pruned
+    ii_normalizer_all = observed_float @ sim_pruned
+    ii_scores_all = np.divide(
+        ii_weighted_sum_all,
+        ii_normalizer_all,
+        out=np.zeros_like(ii_weighted_sum_all, dtype=float),
+        where=ii_normalizer_all > 0,
+    )
+
+    collectors = {
+        "als": {"ndcg": [], "recall": [], "diversity": []},
+        "popularity": {"ndcg": [], "recall": [], "diversity": []},
+        "user_user": {"ndcg": [], "recall": [], "diversity": []},
+        "item_item": {"ndcg": [], "recall": [], "diversity": []},
+    }
+
+    for user_idx in range(n_users):
+        observed_user = observed_bool[user_idx]
+        candidate_mask = ~observed_user
+        ideal_rel = np.sort(
+            np.nan_to_num(test_vals[user_idx, candidate_mask], nan=0.0)
+        )[::-1]
+
+        # ALS
+        als_ranked = _rank_unseen(als_scores_all[user_idx], observed_user)
+        als_metrics = _metrics_from_ranked_idx(
+            als_ranked,
+            test_vals[user_idx],
+            ideal_rel,
+            item_sim=item_sim_full,
+            k=k,
+        )
+
+        # Popularity
+        pop_ranked = _rank_unseen(pop_scores, observed_user)
+        pop_metrics = _metrics_from_ranked_idx(
+            pop_ranked,
+            test_vals[user_idx],
+            ideal_rel,
+            item_sim=item_sim_full,
+            k=k,
+        )
+
+        # User-user
+        row_idx = neighbor_idx[user_idx]
+        row_sim = neighbor_sim[user_idx]
+        keep = row_idx >= 0
+
+        row_idx = row_idx[keep].astype(int, copy=False)
+        row_sim = row_sim[keep].astype(float, copy=False)
+
+        if row_idx.size:
+            uu_weighted_sum = row_sim @ X_filled[row_idx]
+            uu_normalizer = row_sim @ observed_float[row_idx]
+        else:
+            uu_weighted_sum = np.zeros(n_items, dtype=float)
+            uu_normalizer = np.zeros(n_items, dtype=float)
+
+        uu_scores = np.divide(
+            uu_weighted_sum,
+            uu_normalizer,
+            out=np.zeros(n_items, dtype=float),
+            where=uu_normalizer > 0,
+        )
+
+        uu_ranked = _rank_unseen(uu_scores, observed_user)
+        uu_metrics = _metrics_from_ranked_idx(
+            uu_ranked,
+            test_vals[user_idx],
+            ideal_rel,
+            item_sim=item_sim_full,
+            k=k,
+        )
+
+        # Item-item
+        ii_ranked = _rank_unseen(ii_scores_all[user_idx], observed_user)
+        ii_metrics = _metrics_from_ranked_idx(
+            ii_ranked,
+            test_vals[user_idx],
+            ideal_rel,
+            item_sim=item_sim_full,
+            k=k,
+        )
+
+        for metric_name, metric_val in als_metrics.items():
+            if not np.isnan(metric_val):
+                collectors["als"][metric_name].append(metric_val)
+
+        for metric_name, metric_val in pop_metrics.items():
+            if not np.isnan(metric_val):
+                collectors["popularity"][metric_name].append(metric_val)
+
+        for metric_name, metric_val in uu_metrics.items():
+            if not np.isnan(metric_val):
+                collectors["user_user"][metric_name].append(metric_val)
+
+        for metric_name, metric_val in ii_metrics.items():
+            if not np.isnan(metric_val):
+                collectors["item_item"][metric_name].append(metric_val)
+
+    return {
+        "ndcg": {
+            model: _mean_or_nan(vals["ndcg"])
+            for model, vals in collectors.items()
+        },
+        "recall": {
+            model: _mean_or_nan(vals["recall"])
+            for model, vals in collectors.items()
+        },
+        "diversity": {
+            model: _mean_or_nan(vals["diversity"])
+            for model, vals in collectors.items()
+        },
+    }
+
+
+def compute_mean_ndcgs(util, U, V, seed, k=10, top_k_neighbors=25):
+    return compute_seed_metrics(
+        util=util,
+        U=U,
+        V=V,
+        seed=seed,
+        k=k,
+        top_k_neighbors=top_k_neighbors,
+    )["ndcg"]
+
+
+def compute_mean_recalls(util, U, V, seed, k=10, top_k_neighbors=25):
+    return compute_seed_metrics(
+        util=util,
+        U=U,
+        V=V,
+        seed=seed,
+        k=k,
+        top_k_neighbors=top_k_neighbors,
+    )["recall"]
+
+
+def compute_mean_diversities(util, U, V, seed, k=10, top_k_neighbors=25):
+    return compute_seed_metrics(
+        util=util,
+        U=U,
+        V=V,
+        seed=seed,
+        k=k,
+        top_k_neighbors=top_k_neighbors,
+    )["diversity"]
+
+
+def aggregate_seed_metric_results(results_by_seed, seeds=None):
+    """
+    Convert nested per-seed results into summary tables.
+
+    Parameters
+    ----------
+    results_by_seed : dict
+        {seed: {"ndcg": {...}, "recall": {...}, "diversity": {...}}}
+    seeds : sequence, optional
+        Preserve row order.
+
+    Returns
+    -------
+    dict
+        {
+            "tables": {
+                "ndcg": DataFrame,
+                "recall": DataFrame,
+                "diversity": DataFrame,
+            },
+            "summary": {
+                "ndcg": DataFrame,
+                "recall": DataFrame,
+                "diversity": DataFrame,
+                "combined": DataFrame,
+            },
+        }
+    """
+    metric_names = ["ndcg", "recall", "diversity"]
+    model_order = ["popularity", "user_user", "item_item", "als"]
+
+    if seeds is None:
+        seeds = sorted(results_by_seed)
+
+    tables = {}
+    summary = {}
+
+    pretty_metric = {
+        "ndcg": "NDCG@10",
+        "recall": "Recall@10",
+        "diversity": "Diversity@10",
+    }
+
+    pretty_model = {
+        "popularity": "Popularity",
+        "user_user": "User-User",
+        "item_item": "Item-Item",
+        "als": "ALS",
+    }
+
+    for metric in metric_names:
+        df = pd.DataFrame(
+            [
+                [results_by_seed[s][metric][m] for m in model_order]
+                for s in seeds
+            ],
+            index=seeds,
+            columns=[pretty_model[m] for m in model_order],
+        )
+        df.index.name = "Seed"
+        tables[metric] = df
+
+        metric_label = pretty_metric[metric]
+        summary[metric] = pd.DataFrame(
+            {
+                f"Mean {metric_label}": df.mean(),
+                f"Std {metric_label}": df.std(ddof=1),
+            }
+        )
+
+    summary["combined"] = pd.concat(
+        [summary["ndcg"], summary["recall"], summary["diversity"]],
+        axis=1,
+    )
+
+    return {"tables": tables, "summary": summary}
+
+
+def evaluate_recommenders_parallel(
+    util,
+    U,
+    V,
+    seeds,
+    k=10,
+    top_k_neighbors=25,
+    test_frac=0.2,
+    min_pos=2,
+    max_workers=None,
+    backend="process",
+):
+    """
+    Parallel evaluation across seeds.
+
+    backend='process' is the default because this workload is largely CPU-bound.
+    Switch to backend='thread' only if process serialization overhead dominates.
+    """
+    seeds = list(seeds)
+    if not seeds:
+        raise ValueError("seeds must contain at least one value.")
+
+    if max_workers is None:
+        max_workers = min(len(seeds), max(1, os.cpu_count() or 1))
+
+    executor_cls = ProcessPoolExecutor if backend == "process" else ThreadPoolExecutor
+
+    results_by_seed = {}
+    with executor_cls(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(
+                compute_seed_metrics,
+                util,
+                U,
+                V,
+                seed,
+                k,
+                top_k_neighbors,
+                test_frac,
+                min_pos,
+            ): seed
+            for seed in seeds
+        }
+
+        for fut in as_completed(futures):
+            seed = futures[fut]
+            results_by_seed[seed] = fut.result()
+
+    aggregated = aggregate_seed_metric_results(results_by_seed, seeds=seeds)
+
+    return {
+        "by_seed": results_by_seed,
+        "tables": aggregated["tables"],
+        "summary": aggregated["summary"],
+    }
